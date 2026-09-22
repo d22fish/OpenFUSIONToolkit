@@ -5418,25 +5418,27 @@ class TokaMaker_TORAX:
         '''
         return plot_PLH_components(self, save_path=save_path, display=display)
 
-    def plot_disruptivity_limits(self, scale='linear', **kwargs):
+    def plot_disruptivity_limits(self, scale='linear', save_path=None, display=True, limits=None):
         r'''! Plot disruptivity-proxy limits (Greenwald density, Maris density/radiation
         limit, Troyon beta, q95, q0, Tobin Vertical Stability) for the current run, real-units 2x3 grid.
         @param scale 'linear' or 'log' y-axis scale, applied to every subplot.
         '''
-        return plot_disruptivity_limits(self, scale=scale, **kwargs)
+        return plot_disruptivity_limits(self, scale=scale, save_path=save_path, display=display, limits=limits)
 
-    def plot_disruptivity_limits_subset(self, keys, title, scale='linear'):
+    def plot_disruptivity_limits_subset(self, keys, title, scale='linear', save_path=None, display=True, limits=None):
         r'''! Plot a subset of disruptivity-proxy limits (Greenwald density, Maris density/radiation 
         limit, Troyon beta, q95, q0, Tobin Vertical Stability) for the current run, real-units
         @param scale 'linear' or 'log' y-axis scale, applied to every subplot.
+        @param save_path Path to save the plot, if None the plot is not saved.
+        @param display Whether to display the plot.
         '''
-        return plot_disruptivity_limits_subset(self, keys, title, scale=scale)
+        return plot_disruptivity_limits_subset(self, keys, title, scale=scale, save_path=save_path, display=display, limits=limits)
 
-    def print_disruptivity_limits(self, **kwargs):
+    def print_disruptivity_limits(self, limits=None):
         r'''! Print disruptivity-proxy limits (Greenwald density, Maris density/radiation 
         limit, Troyon beta, q95, q0, Tobin Vertical Stability) for the current run, real-units.
         '''
-        return print_disruptivity_limits(self, **kwargs)
+        return print_disruptivity_limits(self, limits=limits)
 
     def summary(self, **kwargs):
         r'''! Print/display a physics summary of the simulation.'''
@@ -5714,27 +5716,34 @@ def _style(ax):
     ax.grid(True, alpha=GRID_ALPHA)
     ax.tick_params(labelsize=TICK_FS)
 
-
-def _tx_scalar(tt, var_name, scale=1.0):
+def _tx_scalar(tt, var_name, scale=1.0, required=False):
     r'''! Return (times, values) arrays from data_tree.scalars at full TORAX resolution.'''
     dt = getattr(tt, '_data_tree', None)
     if dt is None:
+        if required:
+            raise ValueError("TokaMaker_TORAX instance has no _data_tree; run the TORAX coupling first")
         return None, None
     if not hasattr(dt.scalars, var_name):
+        if required:
+            raise ValueError(f"TORAX data_tree has no scalar '{var_name}'")
         return None, None
     var = getattr(dt.scalars, var_name)
     return var.coords['time'].values, var.to_numpy() * scale
 
-
-def _tx_profile_at_rho(tt, var_name, rho_val, rho_coord='rho_norm', scale=1.0):
-    r'''! Return (times, values) for a profile variable at a fixed rho, full resolution.'''
+def _tx_profile_at_rho(tt, var_name, rho_val, rho_coord='rho_norm', scale=1.0, rho_range=None):
+    r'''! Return (times, values) for a profile variable, full resolution. Default is sample at a single
+    rho (nearest point). If given rho_range=(low, high), averages over
+    that band (rho_val is ignored in that case).
+    '''
     dt = getattr(tt, '_data_tree', None)
     if dt is None:
         return None, None
     var = getattr(dt.profiles, var_name)
-    sliced = var.sel(**{rho_coord: rho_val}, method='nearest')
+    if rho_range is not None:
+        sliced = var.sel(**{rho_coord: slice(*rho_range)}).mean(dim=rho_coord)
+    else:
+        sliced = var.sel(**{rho_coord: rho_val}, method='nearest')
     return sliced.coords['time'].values, sliced.to_numpy() * scale
-
 
 def _prof(state_dict, idx):
     r'''! Return (x, y) arrays from a profile state dict, or (None, None).'''
@@ -8117,17 +8126,19 @@ def compute_disruptivity_limits(tt):
     @param tt TokaMaker_TORAX instance.
     @return dict with keys tm_times, all_limits_units, in_h_mode, and lh_transitions.
     '''
-    state = getattr(tt, 'state', tt._state)
+    state = tt.state
     tm = np.asarray(tt._tm_times)
 
     EC = 1.60217662e-19
     MU0 = 4 * np.pi * 1e-7
     EPS0 = 8.8541878128e-12
-    M_D = 3.3435837724e-27  # deuteron mass in kg
-    WARN = 3.5 # Placeholder for Maris LDL25 threshold, not currently used
+    ion_masses = {'H': 1.6726219e-27, 'D': 3.3435837724e-27, 'T': 5.0082670e-27}
+    main_ion = tt._main_ion or {'D': 1.0}
+    M_i = sum(frac * ion_masses[species] for species, frac in main_ion.items())  # mean fuel-ion mass
+    WARN = 3.0 # Placeholder for Maris LDL25 threshold, not currently used
     all_limits_units = {}
 
-    def add_limit_units(name, label, value, limit_curve, units):
+    def add_limit_units(name, label, value, limit_curve, units, worst='max'):
         r'''! Adds a new limit with units, keeps actual plasma quantity 
         separate from its threshold curve so they can be overplotted.
 
@@ -8136,12 +8147,13 @@ def compute_disruptivity_limits(tt):
         @param value Array of the actual physical quantity over time.
         @param limit_curve Threshold in the same units, either a curve or a scalar broadcast over time.
         @param units Units string used for the y axis label.
+        @param worst 'max' if high values are dangerous, 'min' if low values are dangerous.
         @return dict containing the limit entry with keys label, value, limit_curve, units, peak, and peak_time.
         '''
         value = np.asarray(value)
         limit_curve = np.broadcast_to(limit_curve, value.shape)
-        i_peak = int(np.argmax(value))
-        entry = {'label': label, 'value': value, 'limit_curve': limit_curve, 'units': units,
+        i_peak = int(np.argmin(value)) if worst == 'min' else int(np.argmax(value))
+        entry = {'label': label, 'value': value, 'limit_curve': limit_curve, 'units': units, 'worst': worst,
                   'peak': float(value[i_peak]), 'peak_time': float(tm[i_peak])}
         all_limits_units[name] = entry
         return entry
@@ -8167,7 +8179,7 @@ def compute_disruptivity_limits(tt):
     # Compute normalized ion gyroradius at the plasma edge.
     def rho_star_edge(ne, Te, Bt0, R0, a0):
         bt = Bt0 * R0 / (R0 + a0)
-        rho_i = np.sqrt(M_D * Te * EC) / (EC * bt)
+        rho_i = np.sqrt(M_i * Te * EC) / (EC * bt)
         return rho_i / a0
 
     def ldl25_metric(ne, Te, Bt0, R0, a0, kappa, Ip):
@@ -8208,20 +8220,22 @@ def compute_disruptivity_limits(tt):
         rho_star = rho_star_edge(ne, Te, Bt0, R0, a0)
         return nu_star * beta_T**0.8 * rho_star**(-0.6) * q95**1.0
 
-    # Greenwald density limit: n_e line-avg and vol-avg pulled directly from TORAX, n_GW
-    # from Ip/a. Both quantities in 1e20 m^-3, interpolated onto tm_times. n_GW is
-    # itself a curve since it scales with Ip/a over the pulse.
-    tt_ne_line, y_ne_line = _tx_scalar(tt, 'n_e_line_avg', scale=1e-20)
-    tt_ne_vol,  y_ne_vol  = _tx_scalar(tt, 'n_e_volume_avg', scale=1e-20)
+    # Greenwald density limit: n_e line-avg and vol-avg pulled directly from TORAX.
+    # n_GW derived from TORAX's fgw_n_e_line_avg fraction.
+    # Both quantities in 1e20 m^-3, interpolated onto tm_times. n_GW is
+    # a curve since it scales with Ip/a over the pulse.
+    tt_ne_line, y_ne_line = _tx_scalar(tt, 'n_e_line_avg', scale=1e-20, required=True)
+    tt_ne_vol,  y_ne_vol  = _tx_scalar(tt, 'n_e_volume_avg', scale=1e-20, required=True)
     n_e_line = np.interp(tm, tt_ne_line, y_ne_line)
     n_e_vol  = np.interp(tm, tt_ne_vol,  y_ne_vol)
-    n_GW = (np.abs(np.asarray(state['Ip'])) * 1e-6) / (np.pi * np.asarray(state['a'])**2)
+    tt_fgw, y_fgw = _tx_scalar(tt, 'fgw_n_e_line_avg', required=True)
+    fgw = np.interp(tm, tt_fgw, y_fgw)
+    n_GW = n_e_line / fgw
 
     # Maris LDL/HDL metrics
-    # Edge sampled at rho=0.95 rather than the separatrix, since rho=1 is set to
-    # the prescribed boundary condition.
-    tt_ne_edge, ne_edge = _tx_profile_at_rho(tt, 'n_e', 0.95)
-    tt_te_edge, te_edge = _tx_profile_at_rho(tt, 'T_e', 0.95, scale=1e3)  # keV -> eV
+    # Edge density/temperature averaged across rho=[0.85,0.95]
+    tt_ne_edge, ne_edge = _tx_profile_at_rho(tt, 'n_e', None, rho_range=(0.85, 0.95))
+    tt_te_edge, te_edge = _tx_profile_at_rho(tt, 'T_e', None, rho_range=(0.85, 0.95), scale=1e3)
     ne_e_arr = np.interp(tm, tt_ne_edge, ne_edge)
     Te_e_arr = np.interp(tm, tt_te_edge, te_edge)
     q95_arr = np.asarray(state['q95_tm'])
@@ -8243,7 +8257,7 @@ def compute_disruptivity_limits(tt):
     hdl25_raw = np.array(hdl25_raw)
 
     # Beta_N compared against Troyon no-wall beta limit
-    beta_N_tx = np.asarray(state['beta_N_tx'])
+    beta_N = np.asarray(state['beta_N_tm'])
     troyon_limit = 4.0 * np.asarray(state['l_i_tm'])
 
     # q95 and q0: safety factor values compared against their thresholds.
@@ -8251,32 +8265,35 @@ def compute_disruptivity_limits(tt):
     q0_raw = np.asarray(state['q0_tm'])
 
     # Vertical-stability margin: -F'_z from Tobin's equation, unstable when < 0. One
-    # get_vde_growth() call per timestep. The passive-conductor geometry it needs is
-    # cached on the TokaMaker object itself, not recomputed here.
-    vde_raw = np.array([tt._state['equil'][i].get_vde_growth() for i in range(len(tm))])
+    # compute_vertical_stability_margin() call per timestep. The passive-conductor 
+    # geometry it needs is cached on the TokaMaker object itself, not recomputed here.
+    vde_raw = np.array([state['equil'][i].compute_vertical_stability_margin() for i in range(len(tm))])
 
     add_limit_units('n_e_line', 'n_e (line avg)', n_e_line, n_GW, '1e20 m^-3')
     add_limit_units('n_e_vol', 'n_e (vol avg)', n_e_vol, n_GW, '1e20 m^-3')
     add_limit_units('LDL25', 'LDL25', ldl25_raw, np.nan, '-')
     add_limit_units('HDL25', 'HDL25', hdl25_raw, np.nan, '-')
-    add_limit_units('troyon', 'beta_N', beta_N_tx, troyon_limit, '%')
-    add_limit_units('q95', 'q95', q95_raw, 2.0, '-')
-    add_limit_units('q0', 'q0', q0_raw, 1.0, '-')
-    add_limit_units('vde', "-F'_z", vde_raw, 0.0, 'N/m')
+    add_limit_units('troyon', 'beta_N', beta_N, troyon_limit, '%')
+    add_limit_units('q95', 'q95', q95_raw, 2.0, '-', worst='min')
+    add_limit_units('q0', 'q0', q0_raw, 1.0, '-', worst='min')
+    add_limit_units('vde', "-F'_z", vde_raw, 0.0, 'N/m', worst='min')
 
     return {'tm_times': tm, 'all_limits_units': all_limits_units, 'in_h_mode': in_h_mode, 'lh_transitions': lh_transitions}
 
 #### Helper functions to allow functions to be called with just the TokaMaker_TORAX instance ####
-def plot_disruptivity_limits(tt, scale='linear'):
+def plot_disruptivity_limits(tt, scale='linear', save_path=None, display=True, limits=None):
     r'''! Compute and plot disruptivity-proxy limits (Greenwald density, Maris
     density/radiation limit, Troyon beta, q95, q0, Tobin Vertical Stability) on a 2x3 grid.
 
     @param tt TokaMaker_TORAX instance.
     @param scale 'linear' or 'log' y-axis scale, applied to every subplot.
+    @param save_path Path to save the plot, if None the plot is not saved.
+    @param display Whether to display the plot.
+    @param limits Optional precomputed limits dict from compute_disruptivity_limits().
     '''
-    return _show_plots_units(compute_disruptivity_limits(tt), scale=scale)
+    return _show_plots_units(limits or compute_disruptivity_limits(tt), scale=scale, save_path=save_path, display=display)
 
-def plot_disruptivity_limits_subset(tt, keys, title, scale='linear'):
+def plot_disruptivity_limits_subset(tt, keys, title, scale='linear', save_path=None, display=True, limits=None):
     r'''! Compute and plot a chosen subset of disruptivity-proxy limits (by their
     limits['all_limits_units'] key) on one figure, showing actual plasma quantity
     against its threshold curve with units rather than a normalized margin.
@@ -8285,8 +8302,11 @@ def plot_disruptivity_limits_subset(tt, keys, title, scale='linear'):
     @param keys List of limits['all_limits_units'] keys to include.
     @param title Figure title.
     @param scale 'linear', 'log', or 'both'.
+    @param save_path Path to save the plot, if None the plot is not saved.
+    @param display Whether to display the plot.
+    @param limits Optional precomputed limits dict from compute_disruptivity_limits().
     '''
-    return _plot_subset_units(compute_disruptivity_limits(tt), keys, title, scale=scale)
+    return _plot_subset_units(limits or compute_disruptivity_limits(tt), keys, title, scale=scale, save_path=save_path, display=display)
 
 def plot_ldl_hdl_with_mode(limits, ax=None):
     r'''! Plot LDL25 and HDL25, each only where it applies based on L and H transitions.
@@ -8335,18 +8355,19 @@ def plot_dl_combined_single_color(limits, ax, color, label):
     combined = np.where(in_h, hdl, ldl)
     ax.plot(tm, combined, 'o-', color=color, label=label)
 
-def print_disruptivity_limits(tt):
+def print_disruptivity_limits(tt, limits=None):
     r'''! Compute and print a summary of all disruptivity-proxy limits with units, 
     their peak values, and their threshold.
 
     @param tt TokaMaker_TORAX instance.
+    @param limits Optional precomputed limits dict from compute_disruptivity_limits().
     '''
-    return _print_limits_units(compute_disruptivity_limits(tt))
+    return _print_limits_units(limits or compute_disruptivity_limits(tt))
 
 #### Plotting helpers for the limits with units, actual value vs threshold ####
 def _plot_on_units(limits, ax, keys, yscale, title):
     r'''! Plot a subset of limits with units on a given axis, each key's actual value
-    overplotted against its own threshold curve.
+    overplotted against its own threshold curve, shading the unsafe side of the threshold.
 
     @param limits Dictionary containing all limits with units.
     @param ax Matplotlib axis to plot on.
@@ -8355,19 +8376,32 @@ def _plot_on_units(limits, ax, keys, yscale, title):
     @param title Figure title.
     '''
     units = None
+    limit_curve = None
+    worst = None
     for key in keys:
         entry = limits['all_limits_units'][key]
         ax.plot(limits['tm_times'], entry['value'], 'o-', markersize=3, label=entry['label'])
-        if key != 'LDL25' and key != 'HDL25':
-            ax.plot(limits['tm_times'], entry['limit_curve'], 'r--', label=f'{entry["label"]} limit')
+        assert units is None or units == entry['units'], f"mixed units in group {keys}: {units} vs {entry['units']}"
         units = entry['units']
+        limit_curve = entry['limit_curve']
+        worst = entry['worst']
+
     ax.set_yscale(yscale)
     ax.set_xlabel('time [s]')
     ax.set_ylabel(units)
     ax.set_title(title)
     ax.grid(alpha=0.3, which='both')
 
-def _plot_subset_units(limits, keys, title, scale='linear'):
+    if not np.all(np.isnan(limit_curve)):
+        ax.plot(limits['tm_times'], limit_curve, 'r--', label='limit')
+        ylim = ax.get_ylim()
+        bad_edge = ylim[0] if worst == 'min' else ylim[1]
+        ax.fill_between(limits['tm_times'], limit_curve, bad_edge, color='red', alpha=0.1)
+        ax.set_ylim(ylim)
+
+    ax.legend(fontsize=8)
+
+def _plot_subset_units(limits, keys, title, scale='linear', save_path=None, display=True):
     r'''! Plot a chosen subset of limits with units (by their limits['all_limits_units'] key) on
     one figure, showing the actual plasma quantity against its threshold curve.
 
@@ -8375,6 +8409,8 @@ def _plot_subset_units(limits, keys, title, scale='linear'):
     @param keys List of limits['all_limits_units'] keys to include.
     @param title Figure title.
     @param scale 'linear', 'log', or 'both'.
+    @param save_path Path to save the plot, if None the plot is not saved.
+    @param display Whether to display the plot.
     '''
     if scale not in ('linear', 'log', 'both'):
         raise ValueError("scale must be 'linear', 'log', or 'both'")
@@ -8383,23 +8419,23 @@ def _plot_subset_units(limits, keys, title, scale='linear'):
         fig, (ax_lin, ax_log) = plt.subplots(1, 2, figsize=(14, 5))
         _plot_on_units(limits, ax_lin, keys, 'linear', 'linear scale')
         _plot_on_units(limits, ax_log, keys, 'log', 'log scale')
-        ax_log.legend()
     else:
         fig, ax = plt.subplots(figsize=(8, 5))
         _plot_on_units(limits, ax, keys, scale, f'{scale} scale')
-        ax.legend()
 
     fig.suptitle(title)
     plt.tight_layout()
-    plt.show()
+    _save_or_display(fig, save_path, display)
 
 #### Show plots gives all the limits together on a 2x3 grid with units, actual value vs threshold ####
-def _show_plots_units(limits, scale='linear'):
+def _show_plots_units(limits, scale='linear', save_path=None, display=True):
     r'''! Plot all limits together on a 2x3 grid, each subplot with units
     and the actual plasma quantity overplotted against its threshold curve.
 
     @param limits Dict returned by compute_disruptivity_limits().
     @param scale 'linear' or 'log' y-axis scale, applied to every subplot.
+    @param save_path Path to save the plot, if None the plot is not saved.
+    @param display Whether to display the plot.
     '''
     if scale not in ('linear', 'log'):
         raise ValueError("scale must be 'linear' or 'log'")
@@ -8413,31 +8449,12 @@ def _show_plots_units(limits, scale='linear'):
             plot_ldl_hdl_with_mode(limits, ax=ax)
         else:
             _plot_on_units(limits, ax, keys, scale, title)
-    axes.flat[0].legend()
 
     fig.suptitle('Disruptivity-proxy limits')
     plt.tight_layout()
-    plt.show()
+    _save_or_display(fig, save_path, display)
 
-#### Individual limit plots for convenience with units, each on one figure with linear/log/both option ####
-def _plot_greenwald_units(limits, scale='linear'):
-    _plot_subset_units(limits, ['n_e_line', 'n_e_vol'], 'Greenwald density', scale=scale)
-
-def _plot_maris_units(limits, scale='linear'):
-    _plot_subset_units(limits, ['LDL25', 'HDL25'], 'Maris LDL/HDL metrics', scale=scale)
-
-def _plot_troyon_units(limits, scale='linear'):
-    _plot_subset_units(limits, ['troyon'], 'Troyon beta limit', scale=scale)
-
-def _plot_q95_units(limits, scale='linear'):
-    _plot_subset_units(limits, ['q95'], 'q95', scale=scale)
-
-def _plot_q0_units(limits, scale='linear'):
-    _plot_subset_units(limits, ['q0'], 'q0', scale=scale)
-
-def _plot_vde_units(limits, scale='linear'):
-    _plot_subset_units(limits, ['vde'], 'Vertical stability', scale=scale)
-
+#### Print individual limits ####
 def _print_limits_units(limits):
     r'''! Print a summary of all limits with units, peak values, and threshold.
     
