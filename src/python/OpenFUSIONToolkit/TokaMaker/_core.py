@@ -2217,7 +2217,7 @@ class TokaMaker():
             )
         return p0, p1, p2
 
-    def _compute_vertical_stability_geometry(self, n_refine_vessel=1, proximity_frac=0.25):
+    def _compute_vertical_stability_geometry(self, n_refine_vessel=1, proximity_frac=1):
         r'''! Compute geometry for Tobin filament model
 
         @param n_refine_vessel Subdivision levels applied to the near-plasma fraction of each
@@ -2259,12 +2259,29 @@ class TokaMaker():
         R_s = numpy.concatenate(R_s_list)
         Z_s = numpy.concatenate(Z_s_list)
         area_s = numpy.concatenate(area_s_list)
+
         R_c_list, Z_c_list = [], []
-        for name, info in self._coil_dict.items():
-            R_j, Z_j, area_j = self._region_geometry(info['reg_id'], r, lc, reg)
-            R_c_list.append(numpy.sum(R_j * area_j) / numpy.sum(area_j))
-            Z_c_list.append(numpy.sum(Z_j * area_j) / numpy.sum(area_j))
-        R_c, Z_c = numpy.array(R_c_list), numpy.array(Z_c_list)
+        coil_expand_rows, coil_expand_cols, coil_expand_vals = [], [], []
+        sub_idx = 0
+        n_refine_coils = 1
+        for c_idx, (name, info) in enumerate(self._coil_dict.items()):
+            tris = lc[reg == info['reg_id']]
+            p0, p1, p2 = r[tris[:, 0], :2], r[tris[:, 1], :2], r[tris[:, 2], :2]
+            p0, p1, p2 = self._refine_triangles(p0, p1, p2, n_refine_coils)
+            area_j = 0.5 * numpy.abs((p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p2[:, 0] - p0[:, 0]) * (p1[:, 1] - p0[:, 1]))
+            centroid_j = (p0 + p1 + p2) / 3.0
+            R_c_list.append(centroid_j[:, 0]); Z_c_list.append(centroid_j[:, 1])
+
+            w_j = area_j / numpy.sum(area_j)
+            n_j = len(w_j)
+            coil_expand_rows.append(numpy.arange(sub_idx, sub_idx + n_j))
+            coil_expand_cols.append(numpy.full(n_j, c_idx))
+            coil_expand_vals.append(w_j)
+            sub_idx += n_j
+        R_c = numpy.concatenate(R_c_list)
+        Z_c = numpy.concatenate(Z_c_list)
+        coil_expand = numpy.zeros((sub_idx, len(self._coil_dict)))
+        coil_expand[numpy.concatenate(coil_expand_rows), numpy.concatenate(coil_expand_cols)] = numpy.concatenate(coil_expand_vals)
         
         M_ss = self._mutual_inductance(R_s[:, None], Z_s[:, None], R_s[None, :], Z_s[None, :])
         numpy.fill_diagonal(M_ss, self._self_inductance_ring(R_s, area_s))
@@ -2279,7 +2296,7 @@ class TokaMaker():
         Z_grid = (p0[:, 1] + p1[:, 1] + p2[:, 1]) / 3.0
         area_grid = 0.5 * numpy.abs((p1[:, 0] - p0[:, 0]) * (p2[:, 1] - p0[:, 1]) - (p2[:, 0] - p0[:, 0]) * (p1[:, 1] - p0[:, 1]))
         dM_grid_s = self._d_mutual_inductance_dZ1(R_grid[:, None], Z_grid[:, None], R_s[None, :], Z_s[None, :])
-        d2M_grid_c = self._d2_mutual_inductance_dZ1(R_grid[:, None], Z_grid[:, None], R_c[None, :], Z_c[None, :])
+        d2M_grid_c = self._d2_mutual_inductance_dZ1(R_grid[:, None], Z_grid[:, None], R_c[None, :], Z_c[None, :]) @ coil_expand
 
         self._vertical_stability_geometry = {
             'R_s': R_s, 'Z_s': Z_s, 'R_c': R_c, 'Z_c': Z_c, 'M_ss_lu': lu_factor(M_ss),
@@ -2289,7 +2306,7 @@ class TokaMaker():
         self._vertical_stability_geometry_key = cache_key
         return self._vertical_stability_geometry
     
-    def compute_vertical_stability_margin(self,return_gradient=False,use_filament=False,n_refine_vessel=1,proximity_frac=0.25):
+    def compute_vertical_stability_margin(self,return_gradient=False,use_filament=False,n_refine_vessel=1,proximity_frac=1):
         r'''! Compute the Tobin vertical force-gradient stability margin, -F'_z, for the
         current equilibrium.
 
@@ -3221,7 +3238,7 @@ class TokaMaker_equilibrium():
             raise Exception(error_string.value)
         return curr
 
-    def compute_vertical_stability_margin(self, return_gradient=False, use_filament=False, n_refine_vessel=1, proximity_frac=0.25):
+    def compute_vertical_stability_margin(self, return_gradient=False, use_filament=False, n_refine_vessel=1, proximity_frac=1):
         r'''! Compute the Tobin vertical force-gradient stability margin, -F'_z, for this
         solved equilibrium snapshot, reusing the fixed coil geometry and passive-structure
         self-consistency factorization cached on the parent TokaMaker object.
